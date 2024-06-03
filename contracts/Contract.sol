@@ -60,19 +60,25 @@ contract TokenTransferor is OwnerIsCreator {
         uint256 fees // the fee paid for sending the message through CCIP
     );
 
+    // Mappings to keep track of the balances of Ether and ERC20 tokens balance of the user has deposited in the contract
+    mapping(address => uint256) public etherBalance;
+    mapping(address => mapping(address => uint256)) public tokenBalance;
+
     //mapping to keep track of allowlisted destination chains
     mapping(uint64 => bool) public allowListedChains;
 
     IRouterClient private s_router;
     IERC20 private s_linkToken;
+    IERC20 private s_ccipBnMToken;
 
     /// @notice Constructor initializes the contract with the router address
     /// @param _router The address of the router contract
     /// @param _link The address of the link contract
     /// @param _dataConsumerV3Address The address of data consumer contract
-    constructor(address _router, address _link, address _dataConsumerV3Address) {
+    constructor(address _router, address _link, address _ccipBnM, address _dataConsumerV3Address) {
         s_router = IRouterClient(_router);
         s_linkToken = IERC20(_link);
+        s_ccipBnMToken = IERC20(_ccipBnM);
         _dataConsumerV3 = DataConsumerV3(_dataConsumerV3Address);
     }
 
@@ -118,8 +124,105 @@ contract TokenTransferor is OwnerIsCreator {
     function allowlistDestinationChain(
         uint64 _destinationChainSelector,
         bool allowed
-    ) external onlyOwner {
+    ) external {
         allowListedChains[_destinationChainSelector] = allowed;
+    }
+
+    function getFees(
+        uint64 _destinationChainSelector,
+        address _receiver,
+        // address _token, // in this case we use ccipBnM token to transfer so we don't need token address
+        uint256 _amount
+    )
+        public
+        view
+        onlyAllowlistedChain(_destinationChainSelector)
+        validateReceiver(_receiver)
+        returns (uint256)
+    {
+        // create an EVM2AnyMessage struct in memory with necessary information for sending a cross-chain message
+        // address(linkToken means fees are paid in LINK)
+        Client.EVM2AnyMessage memory evm2AnyMessage = _buildCCIPMessage(
+            _receiver,
+            address(s_ccipBnMToken),
+            _amount,
+            address(s_linkToken)
+        );
+
+        // get the fee required to send the message
+        uint256 fees = s_router.getFee(
+            _destinationChainSelector,
+            evm2AnyMessage
+        );
+        return fees;
+    }
+
+    /// @notice Transfer ccipBnM token to receiver on the destination chain
+    /// @notice Pay in LINK
+    /// @dev Assumes your contract has sufficient LINK tokens to pay for the fees
+    /// @param _destinationChainSelector The identifier for the destination blockchain
+    /// @param _receiver The address of the receiver on the destination blockchain
+    // / @param _token The address of the token to be transferred
+    /// @param _amount The amount of tokens to be transferred
+    /// @return messageId The ID of the message that was sent
+    function transferTokensPayLINKDirect(
+        uint64 _destinationChainSelector,
+        address _receiver,
+        // address _token, // in this case we use ccipBnM token to transfer so we don't need token address
+        uint256 _amount
+    )
+        external
+        onlyAllowlistedChain(_destinationChainSelector)
+        validateReceiver(_receiver)
+        returns (bytes32 messageId)
+    {
+        // create an EVM2AnyMessage struct in memory with necessary information for sending a cross-chain message
+        // address(linkToken means fees are paid in LINK)
+        Client.EVM2AnyMessage memory evm2AnyMessage = _buildCCIPMessage(
+            _receiver,
+            address(s_ccipBnMToken),
+            _amount,
+            address(s_linkToken)
+        );
+
+        // get the fee required to send the message
+        uint256 fees = s_router.getFee(
+            _destinationChainSelector,
+            evm2AnyMessage
+        );
+
+        if (fees > s_linkToken.balanceOf(msg.sender))
+            revert NotEnoughBalance(s_linkToken.balanceOf(msg.sender),fees);
+
+        // transfer LINK token from msg.sender to contract with condition that msg.sender has approved contract for transferring enough LINK
+        s_linkToken.safeTransferFrom(msg.sender, address(this), fees);
+        // approve the router to transfer LINK tokens on contract's behalf. It wil spend the fees in LINK
+        s_linkToken.approve(address(s_router), fees);
+
+        // transfer ccipBnM token from msg.sender to contract with condition that msg.sender has approved contract for transferring enough ccipBnM
+        s_ccipBnMToken.safeTransferFrom(msg.sender, address(this), _amount);
+        // approve the router to spend token on contract's behalf. It will spend the amount of the given token
+        s_ccipBnMToken.approve(address(s_router), _amount);
+
+        // send the message through the router and store the returned message ID
+        messageId = s_router.ccipSend(
+            _destinationChainSelector,
+            evm2AnyMessage
+        );
+
+        // emit an event with message details
+        emit TokensTransferred(
+            messageId,
+            _destinationChainSelector,
+            _receiver,
+            address(s_ccipBnMToken),
+            _amount,
+            address(s_linkToken),
+            fees
+        );
+
+        // return the message ID
+        return messageId;
     }
 
     /// @notice Transfer tokens to receiver on the destination chain
@@ -139,7 +242,6 @@ contract TokenTransferor is OwnerIsCreator {
         uint256 _amount
     )
         external
-        onlyOwner
         onlyAllowlistedChain(_destinationChainSelector)
         validateReceiver(_receiver)
         returns (bytes32 messageId)
@@ -206,7 +308,6 @@ contract TokenTransferor is OwnerIsCreator {
         uint256 _amount
     )
         external
-        onlyOwner
         onlyAllowlistedChain(_destinationChainSelector)
         validateReceiver(_receiver)
         returns (bytes32 messageId)
@@ -290,13 +391,15 @@ contract TokenTransferor is OwnerIsCreator {
     /// @notice Fallback function to allow the contract to receive Ether
     /// @dev This function has no function body, making it a default function for receiving Ether
     /// It is automatically called when Ether is transferred to the contract without any data
-    receive() external payable {}
+    receive() external payable {
+        etherBalance[msg.sender] += msg.value;
+    }
 
     /// @notice Allows the contract owner to withdraw the entire balance of Ether from the contract
     /// @dev This function reverts if there are no funds to withdraw or if the transfer fails
     /// It should be called by the owner of the contract
     /// @param _beneficiary The address to which the Ether should be transferred
-    function withdraw(address _beneficiary) public onlyOwner {
+    function withdraw(address _beneficiary) public {
         // retrieve the balance of this contract
         uint256 amount = address(this).balance;
 
@@ -317,7 +420,7 @@ contract TokenTransferor is OwnerIsCreator {
     function withdrawToken(
         address _beneficiary,
         address _token
-    ) public onlyOwner {
+    ) public {
         // Retrieve the balance of this contract
         uint256 amount = IERC20(_token).balanceOf(address(this));
 
@@ -325,5 +428,16 @@ contract TokenTransferor is OwnerIsCreator {
         if (amount == 0) revert NothingToWithdraw();
 
         IERC20(_token).safeTransfer(_beneficiary, amount);
+    }
+
+    /// @notice Deposit ERC20 tokens into the contract
+    /// @param _token The address of the ERC20 token to be deposited
+    /// @param _amount The amount of tokens to be deposited
+    function depositToken(address _token, uint256 _amount) external {
+        // Transfer the tokens from the sender to the contract
+        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+
+        // Record the token balance
+        tokenBalance[msg.sender][_token] += _amount;
     }
 }
