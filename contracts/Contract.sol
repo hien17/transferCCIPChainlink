@@ -401,10 +401,12 @@ contract TokenTransferor is OwnerIsCreator {
     /// @param _beneficiary The address to which the Ether should be transferred
     function withdraw(address _beneficiary) public {
         // retrieve the balance of this contract
-        uint256 amount = address(this).balance;
+        uint256 amount = etherBalance[msg.sender];
 
         // revert if there is nothing to withdraw
-        if (amount == 0) revert NothingToWithdraw();
+        if (amount== 0) revert NothingToWithdraw();
+
+        etherBalance[msg.sender] = 0;
 
         // attempt to send the funds, capturing the success status and discarding any return data
         (bool sent,) = _beneficiary.call{value: amount}("");
@@ -422,10 +424,12 @@ contract TokenTransferor is OwnerIsCreator {
         address _token
     ) public {
         // Retrieve the balance of this contract
-        uint256 amount = IERC20(_token).balanceOf(address(this));
+        uint256 amount = tokenBalance[msg.sender][_token];
 
         // Revert if there is nothing to withdraw
         if (amount == 0) revert NothingToWithdraw();
+
+        tokenBalance[msg.sender][_token] = 0;
 
         IERC20(_token).safeTransfer(_beneficiary, amount);
     }
